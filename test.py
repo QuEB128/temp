@@ -15,6 +15,7 @@ import numpy as np
 from picamera2 import Picamera2
 
 from google import genai
+from google.genai import types
 from deep_translator import GoogleTranslator
 from gtts import gTTS
 import subprocess
@@ -128,15 +129,23 @@ def read_text(text):
     except Exception as e:
         print("? Error:", e)'''
 
-def is_internet_available(timeout=2):
-    try:
-        # Connect to a reliable host (Google DNS)
-        socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(("8.8.8.8", 53))
+_net_ok_until = 0.0
+
+def is_internet_available(timeout=2, cache_seconds=15):
+    """Quick connectivity check. A successful result is cached for a few
+    seconds so repeated checks inside one action cost nothing."""
+    global _net_ok_until
+    now = time.monotonic()
+    if now < _net_ok_until:
         return True
-    except Exception:
+    try:
+        with socket.create_connection(("8.8.8.8", 53), timeout=timeout):
+            pass
+        _net_ok_until = now + cache_seconds
+        return True
+    except OSError:
         return False
-        
+
 # -----------------------
 # Split text into smaller chunks
 # -----------------------
@@ -314,14 +323,77 @@ def play_audio(file, block=True):
 # =========================
 # STEWARD CLASS
 # =========================
+# =========================
+# GEMINI: shared client + speed settings
+# =========================
+GEMINI_API_KEY = "AQ.Ab8RN6Jae-eRXGUzjr0L6mtLvxwMU5BJey1WmezSf-KY_795fQ"
+MODEL_NAME = "gemini-3.6-flash"
+
+_client = None
+_client_lock = threading.Lock()
+
+def get_client():
+    """One client for the whole program, so the TLS connection is reused."""
+    global _client
+    with _client_lock:
+        if _client is None:
+            _client = genai.Client(
+                api_key=GEMINI_API_KEY,
+                http_options=types.HttpOptions(timeout=20000),  # ms; never hang forever
+            )
+        return _client
+
+def _build_thinking_options():
+    """Least thinking first. Which option a model accepts depends on its
+    family, so we try them in order and remember the first one that works."""
+    options = []
+    for kwargs in ({"thinking_level": "minimal"},
+                   {"thinking_level": "low"},
+                   {"thinking_budget": 0}):
+        try:
+            options.append(types.ThinkingConfig(**kwargs))
+        except Exception:
+            pass          # this SDK version doesn't know that option
+    options.append(None)  # last resort: model defaults
+    return options
+
+_THINKING_OPTIONS = _build_thinking_options()
+_thinking_idx = 0
+
+def _make_config(max_tokens=None):
+    thinking = _THINKING_OPTIONS[_thinking_idx]
+    kwargs = {}
+    if thinking is not None:
+        kwargs["thinking_config"] = thinking
+        if max_tokens:
+            kwargs["max_output_tokens"] = max_tokens
+    return types.GenerateContentConfig(**kwargs) if kwargs else None
+
+def _downgrade_thinking(error_text):
+    """If the API rejected our thinking setting, move to the next option."""
+    global _thinking_idx
+    low = error_text.lower()
+    if "thinking" in low and ("400" in error_text or "INVALID_ARGUMENT" in error_text):
+        if _thinking_idx < len(_THINKING_OPTIONS) - 1:
+            _thinking_idx += 1
+            print(f"[INFO] Thinking option rejected, trying option {_thinking_idx}")
+            return True
+    return False
+
+def _warm_up():
+    """Open the network connection at boot so the first real request is fast."""
+    try:
+        get_client().models.get(model=MODEL_NAME)
+    except Exception as e:
+        print("[WARM-UP] skipped:", e)
+
+threading.Thread(target=_warm_up, daemon=True).start()
+
+
 class STEWARD:
     def __init__(self):
-        # Gemini client (NEW SDK)
-        self.client = genai.Client(
-            api_key=  "AIzaSyC8AAEdJpDA4a7ATfnwYoCMsz45mU2kZVA"#"AIzaSyATfdWOaXE96aVqFqP6hycNcBA0bekpyLU" #"AIzaSyDxoA34W61H363zaYzASrkIedgByeGEsCU"  #os.getenv("GEMINI_API_KEY")
-        )
-
-        self.model_name = "gemini-3.6-flash"
+        self.client = get_client()
+        self.model_name = MODEL_NAME
 
         self.image_dir = "image_to_examine"
         os.makedirs(self.image_dir, exist_ok=True)
@@ -442,49 +514,56 @@ class STEWARD:
 
         return text'''
         
-    def gemini_image_prompt(self, image, prompt):
-        if not is_internet_available():
+    def gemini_image_prompt(self, image, prompt, max_tokens=None):
+        if not is_internet_available():          # cached, so effectively free
             play_audio("no_internet.mp3")
             return "No internet connection."
 
-        max_retries = 5
-        delay = 2  # seconds
+        max_retries = 3
+        delay = 1  # seconds (was 2, doubling up to 16)
+        attempt = 0
+        t0 = time.perf_counter()
 
-        for attempt in range(max_retries):
+        while True:
             try:
                 response = self.client.models.generate_content(
                     model=self.model_name,
-                    contents=[prompt, image]
+                    contents=[prompt, image],
+                    config=_make_config(max_tokens)
                 )
 
-                text = response.text
+                text = response.text or ""
+                if not text.strip():
+                    if max_tokens:        # cap may have been eaten by thinking
+                        max_tokens = None
+                        continue
+                    return "I could not get a description."
 
                 # Clean text
                 text = text.replace("*", "")
                 text = text.replace("\n", " ").replace("\r", " ").replace("\t", " ")
                 text = re.sub(r"\s+", " ", text).strip()
 
+                print(f"[TIMING] gemini: {time.perf_counter() - t0:.2f}s")
                 return text
 
             except Exception as e:
-                print(f"[ERROR] Attempt {attempt+1}: {e}")
+                msg = str(e)
+                print(f"[ERROR] {msg}")
 
-                # ?? Handle 503 specifically
-                if "503" in str(e):
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
-                        delay *= 2  # exponential backoff
-                        continue
-                    else:
-                        #play_audio("server_busy.mp3")  # create this file
-                        play_audio("sys_ready.mp3")
-                        return "Server is busy. Please try again later."
+                # Model rejected our thinking setting: try the next one, no delay
+                if _downgrade_thinking(msg):
+                    continue
 
-                # ?? Handle other errors
-                #play_audio("error.mp3")
+                attempt += 1
+                busy = "503" in msg or "UNAVAILABLE" in msg
+                if busy and attempt < max_retries:
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+
                 play_audio("sys_ready.mp3")
-                return "Something went wrong."
-    
+                return "Server is busy. Please try again later." if busy else "Something went wrong."
 
     # -------------------------
     # FEATURES
@@ -498,7 +577,8 @@ class STEWARD:
         image = self.load_image()
         text = self.gemini_image_prompt(
             image,
-            "Describe this image clearly for a visually impaired person.(in less than 50 words)"
+            "Describe this image clearly for a visually impaired person.(in less than 50 words)",
+            max_tokens=250
         )
         read_text(text)
         led.off()
@@ -516,7 +596,8 @@ class STEWARD:
         image = self.load_image()
         short_desc = self.gemini_image_prompt(
             image,
-            "Describe this image in less than 30 words."
+            "Describe this image in less than 30 words.",
+            max_tokens=150
         )
 
         read_text(short_desc)
@@ -525,7 +606,8 @@ class STEWARD:
         if wait_with_button2_check(2):
             detailed = self.gemini_image_prompt(
                 image,
-                "Describe this image in detail as a vision assistant. (in less than 100 words)"
+                "Describe this image in detail as a vision assistant. (in less than 100 words)",
+                max_tokens=400
             )
             read_text(detailed)
 
