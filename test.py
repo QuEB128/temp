@@ -326,7 +326,8 @@ def play_audio(file, block=True):
 # =========================
 # GEMINI: shared client + speed settings
 # =========================
-GEMINI_API_KEY = "AQ.Ab8RN6Jae-eRXGUzjr0L6mtLvxwMU5BJey1WmezSf-KY_795fQ"
+# Paste your key between the quotes. The environment variable is ignored.
+GEMINI_API_KEY = "AIzaSyC8AAEdJpDA4a7ATfnwYoCMsz45mU2kZVA"
 MODEL_NAME = "gemini-3.6-flash"
 
 _client = None
