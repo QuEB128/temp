@@ -328,7 +328,7 @@ def play_audio(file, block=True):
 # =========================
 # Paste your key between the quotes. The environment variable is ignored.
 GEMINI_API_KEY = "AIzaSyC8AAEdJpDA4a7ATfnwYoCMsz45mU2kZVA"
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-2.5-flash"   # 3.6-flash measured at 13-19 s; 2.5-flash at 2-4 s
 
 _client = None
 _client_lock = threading.Lock()
@@ -340,7 +340,7 @@ def get_client():
         if _client is None:
             _client = genai.Client(
                 api_key=GEMINI_API_KEY,
-                http_options=types.HttpOptions(timeout=20000),  # ms; never hang forever
+                http_options=types.HttpOptions(timeout=12000),  # ms; never hang forever
             )
         return _client
 
@@ -348,9 +348,12 @@ def _build_thinking_options():
     """Least thinking first. Which option a model accepts depends on its
     family, so we try them in order and remember the first one that works."""
     options = []
-    for kwargs in ({"thinking_level": "minimal"},
-                   {"thinking_level": "low"},
-                   {"thinking_budget": 0}):
+    candidates = [{"thinking_level": "minimal"},
+                  {"thinking_level": "low"},
+                  {"thinking_budget": 0}]
+    if "2.5" in MODEL_NAME:               # 2.5 models use thinking_budget
+        candidates.reverse()
+    for kwargs in candidates:
         try:
             options.append(types.ThinkingConfig(**kwargs))
         except Exception:
@@ -415,7 +418,7 @@ class STEWARD:
         cmd = [
             "rpicam-still",
             "-o", IMAGE_PATH,
-            "--timeout", "300",       # was 1000: enough for auto-exposure
+            "--timeout", "600",       # was 1000; 300 gave a near-black image
             "--nopreview",
             "--awb", "auto",
             "--width", "1024",        # was 1280x720: smaller = faster upload
@@ -557,7 +560,7 @@ class STEWARD:
                     continue
 
                 attempt += 1
-                busy = "503" in msg or "UNAVAILABLE" in msg
+                busy = any(k in msg for k in ("503", "UNAVAILABLE", "504", "DEADLINE", "timed out"))
                 if busy and attempt < max_retries:
                     time.sleep(delay)
                     delay *= 2
